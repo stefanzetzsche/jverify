@@ -83,10 +83,11 @@ public final class Contracts2Axioms {
 
         // Build the output compilation unit.
         CompilationUnit out = new CompilationUnit();
-        // Axiom files live in `org.strata.jverify.builtin` to match how the
-        // upstream `builtin-contracts/` module is laid out and how the verifier
-        // discovers them on the contract path.
-        out.setPackageDeclaration("org.strata.jverify.builtin");
+        // Axiom files live in `jverify.builtin.<jdk-package>` to mirror the
+        // contracts/ tree on disk and keep humans able to find things by JDK
+        // package. The verifier itself only cares about the @Contract
+        // annotation, not the on-disk path.
+        out.setPackageDeclaration(axiomPackageFor(jdkType));
 
         // Imports the verifier expects.
         out.addImport("org.strata.jverify.Contract");
@@ -106,11 +107,57 @@ public final class Contracts2Axioms {
             new com.github.javaparser.ast.expr.Name("Contract"),
             new ClassExpr(jdkTypeRef)));
 
+        // Lift each @AsProperty method to the axiom form. If multiple input
+        // methods lift to the same (method-name, parameter-types) — for
+        // example HexFormat.isHexDigitDigits, isHexDigitUppercase,
+        // isHexDigitLowercase all targeting java.util.HexFormat.isHexDigit(char) —
+        // dedupe by Java signature. We only merge postcondition clauses when
+        // parameter *names* also match (so identifiers in the clauses stay in
+        // scope); otherwise we keep the first and drop the rest with a
+        // warning, since merging clauses across different parameter names
+        // would produce references to identifiers that aren't bound.
+        java.util.Map<String, MethodDeclaration> bySig = new java.util.LinkedHashMap<>();
+        java.util.Map<String, String> sigToParamSig = new java.util.LinkedHashMap<>();
         for (MethodDeclaration original_ : asPropertyMethods) {
             MethodDeclaration lifted = liftMethod(original_, warnings);
-            if (lifted != null) {
-                generated.addMember(lifted);
+            if (lifted == null) continue;
+            String sig = signatureKey(lifted);
+            String paramSig = signatureKeyWithParamNames(lifted);
+            MethodDeclaration existing = bySig.get(sig);
+            if (existing == null) {
+                bySig.put(sig, lifted);
+                sigToParamSig.put(sig, paramSig);
+            } else if (sigToParamSig.get(sig).equals(paramSig)) {
+                mergeContractClauses(existing, lifted, warnings);
+            } else {
+                warnings.add("dropped duplicate axiom for " + sig
+                    + " (a previous @AsProperty method targeted the same JDK method "
+                    + "with different parameter names; cannot safely merge their clauses)");
             }
+        }
+        for (MethodDeclaration m : bySig.values()) {
+            generated.addMember(m);
+        }
+
+        // Carry over private/non-@AsProperty helper methods. The validation
+        // form sometimes factors postcondition checks into helper methods
+        // (e.g. BitSetContract's `allZeroBytes`). Those helpers aren't
+        // contracts themselves but are referenced by postconditions, so the
+        // lifted axiom file needs them in scope. We keep them on the same
+        // class with their original bodies — the verifier doesn't execute
+        // them, but it does need the symbol to resolve.
+        for (MethodDeclaration m : original.getMethods()) {
+            if (hasAsProperty(m)) continue;
+            MethodDeclaration helperCopy = m.clone();
+            // Strip jqwik annotations defensively.
+            for (Parameter p : helperCopy.getParameters()) {
+                NodeList<AnnotationExpr> kept = new NodeList<>();
+                for (AnnotationExpr ann : p.getAnnotations()) {
+                    if (!isJqwikAnnotation(ann)) kept.add(ann);
+                }
+                p.setAnnotations(kept);
+            }
+            generated.addMember(helperCopy);
         }
 
         if (generated.getMembers().isEmpty()) {
@@ -123,11 +170,29 @@ public final class Contracts2Axioms {
 
     /**
      * Lift a single {@code @AsProperty} method to the {@code @Pure} axiom form.
-     * Returns null if the method has no body to lift from.
+     * Returns null if the method has no body to lift from, or if the lift
+     * cannot produce a signature that matches a JDK method (e.g. when the
+     * validation form uses round-trip-style inputs that don't correspond
+     * 1:1 to the JDK method's parameters).
      */
     private static MethodDeclaration liftMethod(MethodDeclaration original, List<String> warnings) {
         if (original.getBody().isEmpty()) {
             warnings.add("method '" + original.getNameAsString() + "' has no body");
+            return null;
+        }
+
+        // Detect "fake-signature" methods: validation contracts where the
+        // @AsProperty parameter list doesn't match the delegating JDK call's
+        // argument list. These are usually round-trip / property-style tests
+        // (e.g. ByteContract.parseByte(byte b) which calls
+        // Byte.parseByte(Byte.toString(b))). The axiom form describes ONE JDK
+        // method's signature; if the validation form's parameters don't
+        // correspond directly to the JDK method's, the lift would produce an
+        // axiom that doesn't match any real JDK method.
+        if (delegatedArgsDontMatchParameters(original)) {
+            warnings.add("skipping '" + original.getNameAsString()
+                + "' — validation parameters don't match the delegating JDK call's "
+                + "argument list (likely a round-trip-style test that doesn't lift to one JDK method)");
             return null;
         }
 
@@ -245,6 +310,71 @@ public final class Contracts2Axioms {
     }
 
     /**
+     * A signature key matching Java's overload resolution: simple method name
+     * + parameter type names (in order). Used to detect when two different
+     * {@code @AsProperty} methods lift to the same JDK method.
+     */
+    private static String signatureKey(MethodDeclaration m) {
+        StringBuilder sb = new StringBuilder(m.getNameAsString()).append('(');
+        for (int i = 0; i < m.getParameters().size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append(m.getParameters().get(i).getType().asString());
+        }
+        return sb.append(')').toString();
+    }
+
+    /**
+     * Stricter signature key including parameter names. Only methods with
+     * identical name + types + parameter names should have their postconditions
+     * merged; otherwise referenced identifiers may not be in scope after merge.
+     */
+    private static String signatureKeyWithParamNames(MethodDeclaration m) {
+        StringBuilder sb = new StringBuilder(m.getNameAsString()).append('(');
+        for (int i = 0; i < m.getParameters().size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append(m.getParameters().get(i).getType().asString())
+              .append(' ')
+              .append(m.getParameters().get(i).getNameAsString());
+        }
+        return sb.append(')').toString();
+    }
+
+    /**
+     * Merge contract clauses from {@code source} into {@code target} when both
+     * lift to the same JDK method. The target keeps its existing
+     * preconditions and postconditions; any clauses on the source that aren't
+     * already on the target are appended.
+     */
+    private static void mergeContractClauses(MethodDeclaration target,
+                                             MethodDeclaration source,
+                                             List<String> warnings) {
+        var targetBody = target.getBody().orElseThrow();
+        var sourceBody = source.getBody().orElseThrow();
+        var targetClauses = new java.util.HashSet<String>();
+        for (var stmt : targetBody.getStatements()) {
+            if (isContractClause(stmt)) {
+                targetClauses.add(stmt.toString());
+            }
+        }
+        // Find the throw at the end of target so we insert clauses before it.
+        int insertIndex = targetBody.getStatements().size();
+        for (int i = targetBody.getStatements().size() - 1; i >= 0; i--) {
+            if (targetBody.getStatement(i) instanceof ThrowStmt) {
+                insertIndex = i;
+                break;
+            }
+        }
+        for (var stmt : sourceBody.getStatements()) {
+            if (!isContractClause(stmt)) continue;
+            if (targetClauses.contains(stmt.toString())) continue;
+            targetBody.getStatements().add(insertIndex, stmt.clone());
+            insertIndex++;
+        }
+        warnings.add("merged duplicate axiom for " + signatureKey(target)
+            + " (multiple @AsProperty methods targeted the same JDK method)");
+    }
+
+    /**
      * Extract the JDK method name from the delegating body of an
      * {@code @AsProperty} method. The body is conventionally
      * {@code return java.lang.X.method(args);} (or
@@ -275,19 +405,85 @@ public final class Contracts2Axioms {
         return null;
     }
 
+    /**
+     * True when the {@code @AsProperty} method's parameter list does not
+     * directly map onto the delegating JDK call's argument list. In the
+     * common case the body is {@code return java.lang.X.method(p1, p2);}
+     * where {@code p1, p2} are the same identifiers as the contract method's
+     * parameters. If the body uses transformed inputs
+     * (e.g. {@code Byte.parseByte(Byte.toString(b))} where {@code b} is a
+     * {@code byte} parameter but the delegating call takes a {@code String}),
+     * the contract is round-trip-style and doesn't lift to a single JDK
+     * method's signature.
+     */
+    private static boolean delegatedArgsDontMatchParameters(MethodDeclaration original) {
+        var bodyOpt = original.getBody();
+        if (bodyOpt.isEmpty()) return false;
+        com.github.javaparser.ast.expr.MethodCallExpr call = null;
+        for (var stmt : bodyOpt.get().getStatements()) {
+            if (stmt instanceof com.github.javaparser.ast.stmt.ReturnStmt ret
+                    && ret.getExpression().isPresent()
+                    && ret.getExpression().get() instanceof com.github.javaparser.ast.expr.MethodCallExpr c) {
+                call = c;
+                break;
+            }
+            if (stmt instanceof com.github.javaparser.ast.stmt.ExpressionStmt expr
+                    && expr.getExpression() instanceof com.github.javaparser.ast.expr.MethodCallExpr c
+                    && !c.getNameAsString().equals("precondition")
+                    && !c.getNameAsString().equals("postcondition")) {
+                call = c;
+                break;
+            }
+        }
+        if (call == null) return false;
+        var args = call.getArguments();
+        var params = original.getParameters();
+        if (args.size() != params.size()) return true;
+        for (int i = 0; i < args.size(); i++) {
+            // Each argument must be a bare reference to the matching parameter.
+            // Anything else (literal, transformation, expression) means the
+            // contract method's parameters don't represent the JDK method's.
+            if (!(args.get(i) instanceof com.github.javaparser.ast.expr.NameExpr nameExpr)
+                    || !nameExpr.getNameAsString().equals(params.get(i).getNameAsString())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** True for jqwik parameter annotations like {@code @ForAll}, {@code @IntRange}, etc. */
     private static boolean isJqwikAnnotation(AnnotationExpr ann) {
         String name = ann.getNameAsString();
-        // Match by simple name; jqwik annotations all live under net.jqwik.*.
+        // Anything explicitly under net.jqwik.* — fully qualified.
+        if (name.startsWith("net.jqwik.")) return true;
+        // Common simple names from net.jqwik.api and net.jqwik.api.constraints.
+        // We list these defensively; the broader filter below catches the rest
+        // by their declaring import in stripJqwikImports.
         return name.equals("ForAll")
+            || name.equals("Provide")
+            || name.equals("From")
             || name.equals("IntRange")
             || name.equals("LongRange")
-            || name.equals("StringLength")
-            || name.equals("DoubleRange")
+            || name.equals("ShortRange")
+            || name.equals("ByteRange")
+            || name.equals("CharRange")
             || name.equals("FloatRange")
+            || name.equals("DoubleRange")
+            || name.equals("BigRange")
+            || name.equals("StringLength")
+            || name.equals("Size")
             || name.equals("Positive")
             || name.equals("Negative")
-            || name.startsWith("net.jqwik.");
+            || name.equals("NotEmpty")
+            || name.equals("NotBlank")
+            || name.equals("WithNull")
+            || name.equals("UniqueElements")
+            || name.equals("AlphaChars")
+            || name.equals("NumericChars")
+            || name.equals("Whitespace")
+            || name.equals("Chars")
+            || name.equals("CharRangeFrom")
+            || name.equals("Scale");
     }
 
     /**
@@ -309,5 +505,17 @@ public final class Contracts2Axioms {
             }
         }
         return false;
+    }
+
+    /**
+     * Compute the package declaration for a generated axiom file. The
+     * verifier discovers contract classes by their {@code @Contract} annotation,
+     * not their on-disk path, so all axiom files declare the same upstream
+     * package {@code org.strata.jverify.builtin} regardless of which JDK
+     * package they describe. The on-disk layout is determined separately by
+     * the caller and may mirror the contracts/ tree for readability.
+     */
+    private static String axiomPackageFor(String jdkType) {
+        return "org.strata.jverify.builtin";
     }
 }

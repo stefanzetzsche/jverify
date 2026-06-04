@@ -283,6 +283,35 @@ project(":contracts2jqwik") {
     }
 }
 
+project(":contracts2axioms") {
+
+    apply(plugin = "application")
+    application {
+        mainClass.set("org.strata.jverify.contracts2axioms.Main")
+    }
+
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(17)
+        }
+    }
+
+    dependencies {
+        implementation(project(":common"))
+        implementation(project(":library"))
+
+        // JavaParser for source-to-source rewriting; same dep as contracts2jqwik.
+        implementation("com.github.javaparser:javaparser-core:3.26.4")
+
+        testImplementation("org.junit.jupiter:junit-jupiter:5.12.2")
+        testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    }
+
+    tasks.test {
+        useJUnitPlatform()
+    }
+}
+
 project(":verifier") {
 
     apply(plugin = "application")
